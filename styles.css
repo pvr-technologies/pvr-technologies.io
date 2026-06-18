@@ -709,14 +709,24 @@ h3 { font-weight: 600; font-size: clamp(23px, 2.1vw, 32px); line-height: 1.22; }
   gap: clamp(32px, 5vw, 64px);
 }
 .client-logo {
-  height: clamp(26px, 3vw, 34px); width: auto;
+  width: auto;
   filter: grayscale(1); opacity: 0.6;
   transition: filter 0.25s ease, opacity 0.25s ease;
 }
 .client-logo:hover { filter: none; opacity: 1; }
+/* Heights tuned per logo so each occupies a similar visual footprint
+   (wide wordmarks shorter, compact marks taller). Order: ConGlobal,
+   InfraBridge, Silicon Labs, ESAB. */
+.client-logo[alt="ConGlobal"]   { height: clamp(17px, 2.1vw, 23px); }
+.client-logo[alt="InfraBridge"] { height: clamp(24px, 2.9vw, 31px); }
+.client-logo[alt="Silicon Labs"]{ height: clamp(27px, 3.3vw, 36px); }
+.client-logo[alt="ESAB"]        { height: clamp(26px, 3.1vw, 34px); }
 @media (max-width: 600px) {
   .clients-row { gap: 28px 36px; }
-  .client-logo { height: 24px; }
+  .client-logo[alt="ConGlobal"]   { height: 16px; }
+  .client-logo[alt="InfraBridge"] { height: 22px; }
+  .client-logo[alt="Silicon Labs"]{ height: 26px; }
+  .client-logo[alt="ESAB"]        { height: 24px; }
 }
 
 .cred { padding: clamp(80px, 10vw, 140px) 0; text-align: center; }
