@@ -87,3 +87,16 @@ Insert a new section after the hero `</section>` (`index.html:72`):
   written consent. Flag any restriction found in Stage 0 — business call, not mine to assume.
 - **Entity ambiguity** (esp. "Infrabridge") — mitigated by Stage 0 sector sanity check.
 - **Deploy**: push to main = production deploy of thearistotle.ai — leave commit/push to human.
+
+## v2 (2026-09-09) — set change, bigger, one row
+- Set is now ESAB, Silicon Labs, [Quant Global], InfraBridge, Schneider Electric. ConGlobal
+  removed per the new "full logo set"; `images/clients/conglobal.png` left on disk in case
+  that was unintended.
+- Schneider Electric: `images/clients/schneider.svg`, official mark from Wikimedia Commons
+  (`File:Schneider_Electric_2007.svg`), width/height stripped → `viewBox="0 0 188.74 57"`.
+- Sizes ~1.5× (32–54px desktop, 30–36px phone). `.clients-row` is `nowrap` down to 600px so
+  the logos always display across; wraps only on small phones.
+- **Quant Global: BLOCKED on identity.** No client record locally; web candidates are
+  unrelated (NY investment adviser, Malaysian FX-training shop, "QUANT AI Lab" in Paris).
+  Markup slot + CSS height rule are in place (commented `<img>` in `index.html`); confirm the
+  entity/domain, drop `images/clients/quantglobal.svg`, uncomment.
