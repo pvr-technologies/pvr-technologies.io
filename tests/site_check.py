@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import argparse
 import html.parser
+import os
 import re
+import subprocess
 import sys
 import urllib.request
 from collections import Counter
@@ -59,6 +61,24 @@ def cname_configured() -> bool:
     so every CNAME assertion is conditional on the file being present.
     """
     return CNAME.is_file()
+
+
+def github_repo() -> str:
+    """owner/name of the GitHub repo this checkout belongs to."""
+    env = os.environ.get("GITHUB_REPOSITORY")
+    if env:
+        return env
+    try:
+        url = subprocess.run(
+            ["git", "-C", str(ROOT), "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return "ragarwal23/ragarwal.io"
 
 
 def strip_comments(text: str) -> str:
@@ -588,8 +608,12 @@ def test_online() -> None:
         check("redesign-eilla branch index.html fetched", False, str(e))
 
     if cname_configured():
+        # Compare against *this* repo's main: the site has lived in more than
+        # one GitHub repo (ragarwal23/ragarwal.io, then pvr-technologies/...),
+        # so the owner/name is taken from Actions' GITHUB_REPOSITORY or the
+        # origin remote rather than hardcoded.
         main_cname_url = (
-            "https://raw.githubusercontent.com/ragarwal23/ragarwal.io/main/CNAME"
+            f"https://raw.githubusercontent.com/{github_repo()}/main/CNAME"
         )
         try:
             with urllib.request.urlopen(main_cname_url, timeout=15) as r:
