@@ -709,6 +709,9 @@ h3 { font-weight: 600; font-size: clamp(23px, 2.1vw, 32px); line-height: 1.22; }
   gap: clamp(28px, 3.5vw, 48px);
 }
 .client-logo {
+  /* Default height so a logo without a per-brand rule below can never render
+     at its natural pixel size (an 850px-wide PNG once did, via a stale CSS cache). */
+  height: clamp(32px, 4vw, 46px);
   width: auto; flex: 0 0 auto;
   filter: grayscale(1); opacity: 0.6;
   transition: filter 0.25s ease, opacity 0.25s ease;
