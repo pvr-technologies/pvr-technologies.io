@@ -704,9 +704,9 @@ h3 { font-weight: 600; font-size: clamp(23px, 2.1vw, 32px); line-height: 1.22; }
   color: var(--ink-muted); margin: 0 0 28px;
 }
 .clients-row {
-  max-width: var(--maxw); margin: 0 auto; padding: 0 var(--pad);
-  display: flex; flex-wrap: nowrap; justify-content: center; align-items: center;
-  gap: clamp(36px, 5vw, 72px);
+  max-width: 1320px; margin: 0 auto; padding: 0 var(--pad);
+  display: flex; flex-wrap: wrap; justify-content: center; align-items: center;
+  gap: clamp(28px, 3.5vw, 48px);
 }
 .client-logo {
   width: auto; flex: 0 0 auto;
@@ -715,15 +715,17 @@ h3 { font-weight: 600; font-size: clamp(23px, 2.1vw, 32px); line-height: 1.22; }
 }
 .client-logo:hover { filter: none; opacity: 1; }
 /* Heights tuned per logo so each occupies a similar visual footprint
-   (wide wordmarks shorter, compact marks taller). Order: ESAB, Silicon Labs,
-   [Quant Global], InfraBridge, Schneider Electric. */
+   (wide wordmarks shorter, compact marks taller). Order: ConGlobal, ESAB,
+   Silicon Labs, [Quant Global], InfraBridge, Schneider Electric. */
+.client-logo[alt="ConGlobal"]         { height: clamp(26px, 2.5vw, 32px); }
 .client-logo[alt="ESAB"]              { height: clamp(42px, 5.2vw, 60px); }
 .client-logo[alt="Silicon Labs"]      { height: clamp(46px, 5.6vw, 64px); }
 .client-logo[alt="Quant Global"]      { height: clamp(40px, 5.0vw, 56px); }
 .client-logo[alt="InfraBridge"]       { height: clamp(38px, 4.8vw, 54px); }
 .client-logo[alt="Schneider Electric"]{ height: clamp(38px, 4.8vw, 54px); }
 @media (max-width: 600px) {
-  .clients-row { flex-wrap: wrap; gap: 28px 36px; }
+  .clients-row { gap: 24px 32px; }
+  .client-logo[alt="ConGlobal"]         { height: 24px; }
   .client-logo[alt="ESAB"]              { height: 40px; }
   .client-logo[alt="Silicon Labs"]      { height: 42px; }
   .client-logo[alt="Quant Global"]      { height: 38px; }
