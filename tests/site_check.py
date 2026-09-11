@@ -198,7 +198,7 @@ def test_html_head(p: IDCollector, label: str, path: Path) -> None:
     check("has meta viewport (device-width)", p.has_viewport)
     check("has favicon link", 'rel="icon"' in text)
     check("references favicon.png", "images/favicon.png" in text)
-    check("links external styles.css", 'href="styles.css"' in text)
+    check("links external styles.css", bool(re.search(r'href="styles\.css(\?v=[^"]+)?"', text)))
 
 
 def test_anchors(p: IDCollector, label: str) -> None:
@@ -594,6 +594,37 @@ def test_mobile_friendly() -> None:
     )
 
 
+def test_stylesheet_cache_bust() -> None:
+    """GitHub Pages caches styles.css for 10 min; a new index.html paired with a
+    stale stylesheet once rendered a client logo at its natural 850px width.
+    Every page must link the same versioned stylesheet so HTML+CSS ship together."""
+    print("\n[14] Stylesheet cache-busting")
+    versions = set()
+    for page in (INDEX, TEAM, INSIGHTS):
+        m = re.search(r'href="styles\.css\?v=([A-Za-z0-9._-]+)"', page.read_text(encoding="utf-8"))
+        check(f"{page.name} links styles.css?v=<version>", bool(m))
+        if m:
+            versions.add(m.group(1))
+    check("all pages pin the same stylesheet version", len(versions) == 1, f"got {sorted(versions)}")
+
+
+def test_client_logo_heights() -> None:
+    """Every <img class="client-logo"> has a per-brand height rule, and the class
+    itself carries a default height as a backstop."""
+    print("\n[15] Client logo sizing")
+    html = strip_comments(INDEX.read_text(encoding="utf-8"))
+    css = STYLES.read_text(encoding="utf-8")
+    alts = re.findall(r'<img[^>]*alt="([^"]+)"[^>]*class="client-logo"', html)
+    check("client logo strip present", len(alts) >= 1)
+    base = re.search(r"\.client-logo\s*\{[^}]*\bheight:", css)
+    check(".client-logo has a default height", bool(base))
+    for alt in alts:
+        check(
+            f'height rule for logo "{alt}"',
+            bool(re.search(r'\.client-logo\[alt="' + re.escape(alt) + r'"\]\s*\{[^}]*height:', css)),
+        )
+
+
 def test_online() -> None:
     print("\n[13] Online checks")
     branch_url = (
@@ -674,6 +705,8 @@ def main() -> int:
     test_balanced_tags(team_p, "team.html")
     test_balanced_tags(insights_p, "insights.html")
     test_mobile_friendly()
+    test_stylesheet_cache_bust()
+    test_client_logo_heights()
     if args.online:
         test_online()
 
