@@ -2,8 +2,9 @@
 """
 Offline + online checks for the Aristotle site.
 
-Offline checks run against the repo files. The optional --online flag also
-fetches the live URLs to verify HTTP status and content type.
+The site is plain HTML: one file per page at the repo root, nav and footer
+copied into every page, one shared styles.css with a version tag, and a small
+script at the bottom of each page. These checks keep that model honest.
 
 Run:
     python3 tests/site_check.py            # offline checks only
@@ -20,23 +21,46 @@ import re
 import subprocess
 import sys
 import urllib.request
-from collections import Counter
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
-INDEX = ROOT / "index.html"
-TEAM = ROOT / "team.html"
-INSIGHTS = ROOT / "insights.html"
 STYLES = ROOT / "styles.css"
 CNAME = ROOT / "CNAME"
+SITE = "https://thearistotle.ai/"
+EMAIL = "sam@thearistotle.ai"
+
+MAIN_PAGES = [
+    "index.html", "platform.html", "technology.html", "security.html", "customers.html",
+    "private-equity.html", "about.html", "demo.html", "contact.html",
+]
+APP_PAGES = [
+    "pricing-intelligence.html", "customer-intelligence.html", "ready-reckoner.html", "market-sizing.html",
+    "atlas.html", "forecasting.html", "research.html", "ask-aristotle.html",
+]
+STORY_PAGES = [
+    "story-components-pricing.html", "story-industrial-growth.html",
+    "story-private-equity-diligence.html", "story-semiconductor-forecasting.html",
+]
+PAGES = MAIN_PAGES + APP_PAGES + STORY_PAGES
+# Old addresses that stay live as redirects so existing links keep working.
+REDIRECTS = {"team.html": "about.html", "insights.html": "index.html"}
+# Pages held back until their content is ready; nothing may link to them.
+HELD = ["careers", "insights"]
+# Section highlighted in the nav for each page (None: no highlight).
+NAV_SECTION = {
+    "index.html": None, "demo.html": None,
+    "platform.html": "platform", "technology.html": "technology", "security.html": "technology",
+    "customers.html": "customers", "private-equity.html": "pe", "about.html": "company", "contact.html": "company",
+    **{p: "platform" for p in APP_PAGES}, **{p: "customers" for p in STORY_PAGES},
+}
+REMOVED_ASSETS = ["images/hero-chicago.mp4", "images/decks", "images/logos", "images/rachit.jpeg"]
 
 PASS = "\033[32m✓\033[0m"
 FAIL = "\033[31m✗\033[0m"
 
 failures: list[str] = []
 passes: list[str] = []
-
-HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -78,598 +102,304 @@ def github_repo() -> str:
             return m.group(1)
     except (OSError, subprocess.CalledProcessError):
         pass
-    return "ragarwal23/ragarwal.io"
+    return "pvr-technologies/pvr-technologies.io"
 
 
-def strip_comments(text: str) -> str:
-    return HTML_COMMENT_RE.sub("", text)
+# ---------- Parsing ----------
+
+BLOCK_TAGS = {"div", "section", "nav", "footer", "header", "main", "article", "aside", "form", "ul", "table"}
 
 
-# ---------- Parse helpers ----------
-
-
-class IDCollector(html.parser.HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.ids: list[str] = []
-        self.imgs: list[tuple[str, str]] = []
-        self.hrefs: list[str] = []
-        self.tags_open: list[str] = []
-        self.tag_counter: Counter[str] = Counter()
-        self.section_h2s: list[str] = []
-        self._in_h2 = False
-        self._h2_buf: list[str] = []
+class Page(html.parser.HTMLParser):
+    def __init__(self, path: Path) -> None:
+        super().__init__(convert_charrefs=True)
+        self.path = path
+        self.name = path.name
+        self.text = path.read_text(encoding="utf-8")
+        self.ids: set[str] = set()
+        self.links: list[dict] = []
+        self.imgs: list[dict] = []
+        self.meta: dict[str, str] = {}
+        self.link_rel: dict[str, str] = {}
+        self.titles: list[str] = []
+        self.stack: list[str] = []
         self.errors: list[str] = []
-        self.has_viewport = False
-        self.button_min_heights: list[str] = []
+        self._in_title = False
+        self.visible: list[str] = []
+        self._skip = 0
+        self.feed(self.text)
+        self.close()
+        self.visible_text = re.sub(r"\s+", " ", " ".join(self.visible))
 
     def handle_starttag(self, tag, attrs):
-        attr = dict(attrs)
-        self.tag_counter[tag] += 1
-        if "id" in attr and attr["id"]:
-            self.ids.append(attr["id"])
-        if tag == "img":
-            self.imgs.append((attr.get("src") or "", attr.get("alt") or ""))
-        if tag == "a" and "href" in attr and attr["href"]:
-            self.hrefs.append(attr["href"])
-        if tag == "h2":
-            self._in_h2 = True
-            self._h2_buf = []
-        if tag == "meta" and attr.get("name") == "viewport":
-            content = attr.get("content", "")
-            self.has_viewport = "width=device-width" in content
-        if tag in {"div", "section", "nav", "footer", "header", "main", "article"}:
-            self.tags_open.append(tag)
+        a = {k: (v or "") for k, v in attrs}
+        if a.get("id"):
+            self.ids.add(a["id"])
+        if tag == "a":
+            self.links.append(a)
+        elif tag == "img":
+            self.imgs.append(a)
+        elif tag == "meta":
+            key = a.get("name") or a.get("property") or a.get("http-equiv")
+            if key:
+                self.meta[key] = a.get("content", "")
+        elif tag == "link" and a.get("rel"):
+            self.link_rel.setdefault(a["rel"], a.get("href", ""))
+        elif tag == "title":
+            self._in_title = True
+            self.titles.append("")
+        if tag in ("script", "style"):
+            self._skip += 1
+        if tag in BLOCK_TAGS:
+            self.stack.append(tag)
 
     def handle_endtag(self, tag):
-        if tag == "h2" and self._in_h2:
-            self._in_h2 = False
-            self.section_h2s.append("".join(self._h2_buf).strip())
-        if tag in {"div", "section", "nav", "footer", "header", "main", "article"}:
-            if self.tags_open and self.tags_open[-1] == tag:
-                self.tags_open.pop()
+        if tag == "title":
+            self._in_title = False
+        if tag in ("script", "style"):
+            self._skip -= 1
+        if tag in BLOCK_TAGS:
+            if self.stack and self.stack[-1] == tag:
+                self.stack.pop()
             else:
                 self.errors.append(f"unbalanced </{tag}>")
 
     def handle_data(self, data):
-        if self._in_h2:
-            self._h2_buf.append(data)
+        if self._in_title:
+            self.titles[-1] += data
+        elif not self._skip:
+            self.visible.append(data)
+
+    def block(self, tag: str) -> str:
+        m = re.search(rf"<{tag}\b.*?</{tag}>", self.text, re.S)
+        return m.group(0) if m else ""
+
+    def script(self) -> str:
+        m = re.search(r"<script>(.*?)</script>", self.text, re.S)
+        return m.group(1) if m else ""
 
 
-def parse(path: Path) -> IDCollector:
-    p = IDCollector()
-    p.feed(path.read_text(encoding="utf-8"))
-    return p
+def load(name: str) -> Page | None:
+    path = ROOT / name
+    return Page(path) if path.is_file() else None
+
+
+def canonical_url(name: str) -> str:
+    return SITE if name == "index.html" else SITE + name
 
 
 # ---------- Tests ----------
 
 
-def test_files_exist() -> None:
-    print("\n[1] File existence")
-    check("index.html exists", INDEX.is_file())
-    check("team.html exists", TEAM.is_file())
-    check("insights.html exists", INSIGHTS.is_file())
+def test_files_exist(pages: dict[str, Page | None]) -> None:
+    print("\n[1] Files")
+    for name in PAGES:
+        check(f"{name} exists", pages[name] is not None)
+    for name in REDIRECTS:
+        check(f"{name} exists as a redirect", (ROOT / name).is_file())
     check("styles.css exists", STYLES.is_file())
+    for rel in ["images/favicon.png", "images/apple-touch-icon.png", "images/social-preview.png"]:
+        check(f"{rel} exists", (ROOT / rel).is_file())
     if cname_configured():
         check("CNAME exists", True)
     else:
-        skip("CNAME absent — no custom domain configured in this repo; CNAME checks skipped")
-    check("images/ dir exists", (ROOT / "images").is_dir())
-    for fname in ("favicon.png", "sam.jpeg", "bia.jpeg", "rachit.jpeg"):
-        check(f"images/{fname} exists", (ROOT / "images" / fname).is_file())
+        skip("no CNAME in this checkout — custom domain checks skipped")
+    stray = sorted(p.name for p in ROOT.glob("*.html") if p.name not in PAGES and p.name not in REDIRECTS)
+    check("no unexpected pages at the root", not stray, f"found {stray}")
 
 
 def test_cname() -> None:
-    print("\n[2] CNAME format")
+    print("\n[2] CNAME")
     if not cname_configured():
-        skip("no CNAME in this checkout — skipped")
+        skip("CNAME checks skipped")
         return
     text = CNAME.read_text(encoding="utf-8").strip()
     check("CNAME is not empty", bool(text))
     check("CNAME has exactly one domain", len(text.splitlines()) == 1)
-    valid_domains = {"aristotletechnology.com", "thearistotle.ai"}
-    check(
-        f"CNAME is one of {sorted(valid_domains)}",
-        text in valid_domains,
-        f"got {text!r}",
-    )
-    check(
-        "CNAME has no trailing whitespace",
-        text == text.strip(),
-    )
-    check(
-        "CNAME is valid domain syntax",
-        bool(re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", text)),
-        f"got {text!r}",
-    )
+    check("CNAME is thearistotle.ai", text == "thearistotle.ai", f"got {text!r}")
 
 
-def test_html_head(p: IDCollector, label: str, path: Path) -> None:
-    print(f"\n[3] HTML head ({label})")
-    text = path.read_text(encoding="utf-8")
-    check("has DOCTYPE", text.lstrip().lower().startswith("<!doctype html>"))
-    check("html lang attr present", 'lang="en"' in text)
-    check("has <title>", "<title>" in text and "</title>" in text)
-    check(
-        "title mentions Aristotle",
-        bool(re.search(r"<title>[^<]*Aristotle[^<]*</title>", text)),
-    )
-    check("has meta viewport (device-width)", p.has_viewport)
-    check("has favicon link", 'rel="icon"' in text)
-    check("references favicon.png", "images/favicon.png" in text)
-    check("links external styles.css", bool(re.search(r'href="styles\.css(\?v=[^"]+)?"', text)))
+def test_heads(pages: dict[str, Page]) -> None:
+    print("\n[3] Page heads")
+    for name, p in pages.items():
+        t = p.text
+        check(f"{name}: DOCTYPE", t.lstrip().lower().startswith("<!doctype html>"))
+        check(f"{name}: lang=\"en\"", '<html lang="en">' in t)
+        check(f"{name}: one non-empty <title>", len(p.titles) == 1 and bool(p.titles[0].strip()))
+        if name != "index.html":
+            check(f"{name}: title ends with '| Aristotle'", p.titles[0].strip().endswith("| Aristotle"), p.titles[0])
+        desc = p.meta.get("description", "")
+        check(f"{name}: description present and under 200 characters", 0 < len(desc) <= 200, f"{len(desc)} chars")
+        check(f"{name}: viewport set to device width", "width=device-width" in p.meta.get("viewport", ""))
+        check(f"{name}: favicon is images/favicon.png", p.link_rel.get("icon") == "images/favicon.png")
+        url = canonical_url(name)
+        check(f"{name}: canonical URL", p.link_rel.get("canonical") == url, p.link_rel.get("canonical", ""))
+        check(f"{name}: og:url matches canonical", p.meta.get("og:url") == url)
+        og_img = p.meta.get("og:image", "")
+        check(f"{name}: og:image is an absolute https URL", og_img.startswith(SITE))
+        check(f"{name}: og:image file exists", (ROOT / og_img.replace(SITE, "")).is_file())
+        check(f"{name}: og:title and twitter:title set", bool(p.meta.get("og:title")) and bool(p.meta.get("twitter:title")))
+        check(f"{name}: links styles.css with a version", bool(re.search(r'href="styles\.css\?v=[^"]+"', t)))
 
 
-def test_anchors(p: IDCollector, label: str) -> None:
-    print(f"\n[4] Anchor integrity ({label})")
-    ids = set(p.ids)
-    check(
-        "no duplicate IDs",
-        len(p.ids) == len(ids),
-        f"dupes: {[i for i,c in Counter(p.ids).items() if c>1]}",
-    )
-    anchors = [h for h in p.hrefs if h.startswith("#") and h != "#"]
-    missing = [a for a in anchors if a[1:] not in ids]
-    check(
-        f"all {len(anchors)} internal anchors resolve",
-        not missing,
-        f"missing IDs: {sorted(set(missing))}",
-    )
-    check("no empty hrefs", "" not in p.hrefs)
-    check(
-        "no href='#' (lazy placeholder)",
-        "#" not in p.hrefs,
-        f"found bare '#' link in {label}",
-    )
-    check("no javascript: URLs", not any(h.lower().startswith("javascript:") for h in p.hrefs))
-
-
-def test_images(p: IDCollector, where: str) -> None:
-    print(f"\n[5] Images ({where})")
-    for src, alt in p.imgs:
-        if src.startswith(("http://", "https://", "data:")):
-            continue
-        path = ROOT / src
-        check(f"image file exists: {src}", path.is_file())
-        check(f"image has alt text: {src}", bool(alt.strip()), f"alt={alt!r}")
-
-
-def test_required_sections(p: IDCollector) -> None:
-    print("\n[6] Required sections present (index.html)")
-    h2_text = " | ".join(p.section_h2s)
-    # Path-merged section removed; platform now lives in its own section without an H2.
-    expected_h2 = [
-        ("comparison", "Ours Does"),
-        ("credibility", "Decades of expertise"),
-        ("sectors", "Leaders Across Various Sectors"),
-        ("cases", "Case Studies"),
-        ("qa", "Q&A"),
-    ]
-    for label, needle in expected_h2:
-        check(
-            f"section <{label}> headline contains {needle!r}",
-            needle in h2_text,
-            f"got: {h2_text}",
-        )
-    # Platform sub-band is now an h3 inside the merged path section; check the file directly
-    raw = INDEX.read_text(encoding="utf-8")
-    check(
-        "platform sub-band h3 'Growth Meets'",
-        bool(re.search(r"<h3[^>]*class=\"platform-h3\"[^>]*>.*?Growth Meets.*?</h3>", raw, re.DOTALL)),
-    )
-
-    expected_ids = [
-        "hero", "value", "different", "offerings",
-        "expertise", "sectors", "cases", "qa", "contact",
-    ]
-    actual_ids = set(p.ids)
-    for sid in expected_ids:
-        check(f"section id='{sid}' exists", sid in actual_ids)
-
-
-def test_design_tokens() -> None:
-    print("\n[7] Design tokens (styles.css)")
-    text = STYLES.read_text(encoding="utf-8")
-    expected = {
-        "--bg": r"--bg:\s*#[0-9A-Fa-f]{3,8}",
-        "--bg-alt": r"--bg-alt:\s*#[0-9A-Fa-f]{3,8}",
-        "--navy": r"--navy:\s*#[0-9A-Fa-f]{3,8}",
-        "--navy-deep": r"--navy-deep:\s*#[0-9A-Fa-f]{3,8}",
-        "--ink": r"--ink:\s*#[0-9A-Fa-f]{3,8}",
-        "--ink-muted": r"--ink-muted:\s*#[0-9A-Fa-f]{3,8}",
-        "--line": r"--line:\s*#[0-9A-Fa-f]{3,8}",
-        "--white": r"--white:\s*#[0-9A-Fa-f]{3,8}",
-        "--radius-pill": r"--radius-pill:\s*\d+px",
-    }
-    for name, pattern in expected.items():
-        check(f"token defined: {name}", bool(re.search(pattern, text)))
-
-
-def test_content_invariants() -> None:
-    print("\n[8] Content invariants (index.html)")
-    text = INDEX.read_text(encoding="utf-8")
-    visible = strip_comments(text)
-
-    # Hero
-    check(
-        "hero headline category claim",
-        "AI-native growth" in visible and "pricing advisory" in visible,
-    )
-    check("hero CTA: 'Book a Meeting'", "Book a Meeting" in visible)
-
-    # Hero video background slot
-    check(
-        "hero has video bg slot (.hero-bg)",
-        'class="hero-bg"' in text,
-    )
-    check(
-        "hero video TODO comment references hero-chicago.mp4",
-        "hero-chicago.mp4" in text,
-    )
-    check(
-        "hero has dark overlay for text readability",
-        'class="hero-overlay"' in text,
-    )
-
-    # Stat band — refreshed claims (40x ROI, <1 month, $2B+, Tied to impact)
-    check("stat band: '40x'", "40x" in visible)
-    check(
-        "stat band: '<1 month' or '&lt;1 month'",
-        "&lt;1 month" in visible or "<1 month" in visible,
-    )
-    check("stat band: '$2B+'", "$2B+" in visible)
-    check("stat band: 'Tied to impact'", "Tied to impact" in visible)
-
-    # Press strip removed (firms moved under credibility; only McKinsey + BLACKSTONE remain)
-    check("press strip removed (no <section class=\"press\">)", 'class="press"' not in text)
-    check("cred-alumni block present under credibility", 'class="cred-alumni"' in text)
-    check("alumni: McKinsey under credibility", "McKinsey" in visible)
-    check("alumni: BLACKSTONE under credibility", "BLACKSTONE" in visible)
-    # Removed alumni firms must not appear as alumni labels (we only check the
-    # cred-alumni block — these firms can still appear in body copy / Q&A naming MBB).
-    cred_alumni_match = re.search(r'<div class="cred-alumni"[^>]*>(.*?)</div>', text, re.DOTALL)
-    cred_alumni_text = cred_alumni_match.group(1) if cred_alumni_match else ""
-    for firm in ("BCG", "Bain", "Deloitte", "KKR"):
-        check(
-            f"removed alumni label not present in cred-alumni: {firm!r}",
-            firm not in cred_alumni_text,
-        )
-
-    # Path-merged section was removed; the funnel + partner cards no longer exist.
-    # The pillars survived the cleanup and now sit under the platform section.
-
-    # Pillars
-    for pillar in ("Partner-Led", "AI Advantage", "Faster to Impact", "Capability Embedded"):
-        check(f"pillar present: {pillar!r}", pillar in visible)
-
-    # Product showcase
-    check("product: 'Growth Meets'", "Growth Meets" in visible)
-    check("product capability: 'Opportunity Identification'", "Opportunity Identification" in visible)
-    check("product capability: 'Pricing'", "Pricing" in visible)
-    check("product capability: 'Demand Forecasting'", "Demand Forecasting" in visible)
-    check(
-        "product capability: 'Geospatial Mapping' or 'Growth Analytics'",
-        "Geospatial Mapping" in visible or "Growth Analytics" in visible,
-    )
-
-    # Credibility band
-    check("cred: '$1B+'", "$1B+" in visible)
-    check("cred: '50+'", "50+" in visible)
-
-    # Sectors
-    for sector in ("Industrials", "Semis", "Tech &amp; SaaS",
-                   "Distribution", "Consumer", "PE"):
-        check(f"sector present: {sector!r}", sector in visible)
-
-    # Comparison columns
-    for col in ("Aristotle", "No Advisor", "Big-3 (MBB)", "Boutiques"):
-        check(f"comparison column: {col!r}", col in visible)
-
-    # Closing CTA
-    check(
-        "closing CTA headline mentions '$100M' and '30 Days'",
-        "$100M" in visible and "30 Days" in visible,
-    )
-    # Closing CTA uses a single 'Book a Meeting' button (simplified from earlier
-    # dual-CTA). 'Book a Meeting' already asserted in hero check above.
-
-    # Regressions: old design state must NOT appear
-    check("regression: no 'BlackRock'", "BlackRock" not in visible and "Blackrock" not in visible)
-    check("regression: no old 'Start a Conversation' CTA", "Start a Conversation" not in visible)
-    check("regression: no flywheel remnants", "flywheel" not in text.lower())
-    check("regression: no 'Playfair Display' headline font", "Playfair Display" not in text)
-    check("regression: no old logo-strip section in index", "logo-strip" not in text)
-
-
-def test_team_page(p: IDCollector) -> None:
-    print("\n[8b] Team page (team.html)")
-    text = TEAM.read_text(encoding="utf-8")
-    visible = strip_comments(text)
-    check("Sam Garg present", "Sam Garg" in visible)
-    check("Beatriz Abramof present", "Beatriz Abramof" in visible)
-    check("Rachit Agarwal present", "Rachit Agarwal" in visible)
-    check("3 team cards", text.count('class="team-card') == 3 or text.count("team-bio-card") == 3)
-    check("nav links back to index.html", 'href="index.html"' in text)
-    check("nav has Insights link", 'href="insights.html"' in text)
-
-
-def test_insights_page(p: IDCollector) -> None:
-    print("\n[8c] Insights page (insights.html)")
-    text = INSIGHTS.read_text(encoding="utf-8")
-    visible = strip_comments(text)
-    check("page title 'Notes from the field'", "Notes from the field" in visible)
-    insight_cards = text.count('class="insight-card"')
-    check(f"insight cards count >= 3 (got {insight_cards})", insight_cards >= 3)
-    check("nav links back to index.html", 'href="index.html"' in text)
-    check("nav has Team link", 'href="team.html"' in text)
-
-
-def test_structural_counts() -> None:
-    print("\n[9] Structural counts (index.html)")
-    text = INDEX.read_text(encoding="utf-8")
-
-    pillars = len(re.findall(r'<div class="pillar">', text))
-    check(f"pillars section has 4 cards (got {pillars})", pillars == 4)
-
-    stat_items = len(re.findall(r'<div class="stat">', text))
-    check(f"stat band has 4 items (got {stat_items})", stat_items == 4)
-
-    qa_items = len(re.findall(r'<details class="qa-item">', text))
-    check(f"Q&A has 6 entries (got {qa_items})", qa_items == 6)
-
-    case_cards = len(re.findall(r'class="case-card', text))
-    check(f"case studies has 4 cards (got {case_cards})", case_cards == 4)
-
-    sectors = len(re.findall(r'<div class="sector">', text))
-    check(f"sectors grid has 6 tiles (got {sectors})", sectors == 6)
-
-    cred_stats = len(re.findall(r'class="cred-num"', text))
-    check(f"credibility band has 3 numerals (got {cred_stats})", cred_stats == 3)
-
-    # Platform pillars are 4 tabbed <button>s, one per capability area
-    pillar_tabs = len(re.findall(r'<button[^>]*class="pillar-tab(?:[^"]*)"', text))
-    check(f"platform has 4 pillar tabs (got {pillar_tabs})", pillar_tabs == 4)
-    check(
-        "pillar tabs have aria-selected for a11y",
-        text.count('aria-selected="true"') >= 1
-        and text.count('aria-selected="false"') >= 3,
-    )
-    pillar_panels = len(re.findall(r'class="pillar-panel(?:\s[^"]*)?"', text))
-    check(
-        f"pillar panels present (one per tab, got {pillar_panels})",
-        pillar_panels == 4,
-    )
-    check(
-        "pillar deck handler wired in JS",
-        ".pillar-tab" in text and "activatePillar" in text,
-    )
-
-    compare_rows = len(re.findall(r"<tr>\s*<td class=\"compare-row-label\">", text))
-    check(f"comparison has 6 data rows (got {compare_rows})", compare_rows == 6)
-
-    # Credibility alumni: exactly 2 labels (McKinsey + BLACKSTONE)
-    cred_alumni_match = re.search(r'<div class="cred-alumni"[^>]*>(.*?)</div>', text, re.DOTALL)
-    cred_alumni_inner = cred_alumni_match.group(1) if cred_alumni_match else ""
-    alumni_labels = len(re.findall(r"<span>", cred_alumni_inner))
-    check(
-        f"credibility alumni has 2 labels (got {alumni_labels})",
-        alumni_labels == 2,
-    )
-
-
-def test_no_visible_placeholders() -> None:
-    print("\n[10] No visible placeholder text")
-    case_insensitive = ["lorem ipsum"]
-    case_sensitive = ["FIXME", "XXX:", "PLACEHOLDER", "TBD"]
-    for path in (INDEX, TEAM, INSIGHTS):
-        visible = strip_comments(path.read_text(encoding="utf-8"))
-        for needle in case_insensitive:
-            check(
-                f"{path.name}: no visible '{needle}'",
-                needle.lower() not in visible.lower(),
-            )
-        for needle in case_sensitive:
-            check(
-                f"{path.name}: no visible '{needle}'",
-                needle not in visible,
-            )
-
-
-def test_balanced_tags(p: IDCollector, where: str) -> None:
-    print(f"\n[11] Tag balance ({where})")
-    check("no unbalanced section/div/nav/footer", not p.tags_open, f"left open: {p.tags_open}")
-    check("HTML parser had no errors", not p.errors, f"errors: {p.errors[:3]}")
-    text = (INDEX if where == "index.html" else TEAM if where == "team.html" else INSIGHTS).read_text(encoding="utf-8")
-    check("<style> tags balanced", text.count("<style>") == text.count("</style>"))
-    check("<script> tags balanced", text.count("<script>") == text.count("</script>"))
-
-
-def test_mobile_friendly() -> None:
-    """Static checks that the site is set up to render correctly on mobile.
-
-    Cannot fully verify visual behavior without a headless browser, but these
-    catch the common regressions: missing viewport tag, no media queries,
-    wide tables not wrapped in horizontal-scroll containers, buttons too small
-    to tap, missing hamburger menu for narrow viewports.
-    """
-    print("\n[12] Mobile-friendliness")
-
-    css = STYLES.read_text(encoding="utf-8")
-
-    # 1. Meta viewport — verified per-page via IDCollector elsewhere; re-affirm
-    for path in (INDEX, TEAM, INSIGHTS):
-        text = path.read_text(encoding="utf-8")
-        check(
-            f"{path.name}: meta viewport with device-width",
-            'name="viewport"' in text and "width=device-width" in text,
-        )
-
-    # 2. CSS contains responsive breakpoints
-    media_queries = re.findall(r"@media\s*\([^)]*max-width:\s*(\d+)px", css)
-    breakpoints = sorted({int(m) for m in media_queries})
-    check(
-        f"styles.css declares max-width breakpoints (got {breakpoints})",
-        len(breakpoints) >= 2 and min(breakpoints) <= 640,
-        "expect at least 2 breakpoints, smallest <=640px",
-    )
-
-    # 3. prefers-reduced-motion guard
-    check(
-        "styles.css respects prefers-reduced-motion",
-        "@media (prefers-reduced-motion: reduce)" in css,
-    )
-
-    # 4. Touch targets — .btn min-height >= 44px
-    btn_match = re.search(r"\.btn\s*\{[^}]*min-height:\s*(\d+)px", css)
-    if btn_match:
-        check(
-            f".btn min-height >= 44px (got {btn_match.group(1)}px)",
-            int(btn_match.group(1)) >= 44,
-        )
-    else:
-        check(".btn defines min-height for touch target", False, "no min-height on .btn")
-
-    # 5. Wide tables are wrapped in horizontal-scroll containers
-    compare_block = re.search(r"\.compare-wrap\s*\{[^}]*\}", css, re.DOTALL)
-    check(
-        ".compare-wrap has overflow-x scroll",
-        bool(compare_block) and "overflow-x:" in compare_block.group(0),
-    )
-    product_block = re.search(r"\.product-mock\s*\{[^}]*\}", css, re.DOTALL)
-    check(
-        ".product-mock has overflow-x scroll",
-        bool(product_block) and "overflow-x:" in product_block.group(0),
-    )
-
-    # 6. Mobile nav: hamburger button must exist in HTML + CSS
-    for path in (INDEX, TEAM, INSIGHTS):
-        text = path.read_text(encoding="utf-8")
-        check(
-            f"{path.name}: hamburger button present",
-            "nav-hamburger" in text and 'aria-controls="nav-links"' in text,
-        )
-        check(
-            f"{path.name}: hamburger has aria-expanded",
-            'aria-expanded="false"' in text,
-        )
-    check(
-        ".nav-hamburger styled and toggleable in styles.css",
-        ".nav-hamburger" in css and ".nav-links.open" in css,
-    )
-
-    # 7. Section-level grids must collapse on mobile (must have grid-template-columns: 1fr
-    #    somewhere inside a max-width media query for stacked rendering)
-    mobile_blocks = re.findall(r"@media\s*\([^)]*max-width:[^)]*\)\s*\{[\s\S]*?(?:\}\s*\}|\}\s*$)", css)
-    has_single_col_collapse = any(
-        "grid-template-columns: 1fr" in block for block in mobile_blocks
-    )
-    check(
-        "CSS collapses grids to single column on mobile",
-        has_single_col_collapse,
-        "no `grid-template-columns: 1fr` inside any max-width media query",
-    )
-
-    # 8. No inline `width:` greater than 720px on any element
-    inline_widths = re.findall(r'style="[^"]*width:\s*(\d+)px', INDEX.read_text(encoding="utf-8"))
-    too_wide = [int(w) for w in inline_widths if int(w) > 720]
-    check(
-        "no overly-wide inline widths in index.html",
-        not too_wide,
-        f"got {too_wide}",
-    )
-
-    # 9. Body font-size readable on mobile (>=15px declared)
-    body_size = re.search(r"body\s*\{[^}]*font-size:\s*(\d+)px", css)
-    check(
-        f"body font-size >= 15px (got {body_size.group(1) if body_size else 'none'}px)",
-        bool(body_size) and int(body_size.group(1)) >= 15,
-    )
-
-    # 10. Hero h1 has overflow-wrap or word-break so long phrases don't overflow on narrow screens
-    hero_h1 = re.search(r"\.hero h1\s*\{[^}]*\}", css, re.DOTALL)
-    check(
-        ".hero h1 wraps long words on narrow viewports",
-        bool(hero_h1) and ("overflow-wrap" in hero_h1.group(0) or "word-break" in hero_h1.group(0)),
-    )
-
-
-def test_stylesheet_cache_bust() -> None:
-    """GitHub Pages caches styles.css for 10 min; a new index.html paired with a
-    stale stylesheet once rendered a client logo at its natural 850px width.
-    Every page must link the same versioned stylesheet so HTML+CSS ship together."""
-    print("\n[14] Stylesheet cache-busting")
-    versions = set()
-    for page in (INDEX, TEAM, INSIGHTS):
-        m = re.search(r'href="styles\.css\?v=([A-Za-z0-9._-]+)"', page.read_text(encoding="utf-8"))
-        check(f"{page.name} links styles.css?v=<version>", bool(m))
-        if m:
-            versions.add(m.group(1))
+def test_stylesheet_version(pages: dict[str, Page]) -> None:
+    print("\n[4] Stylesheet version")
+    versions = {m.group(1) for p in pages.values() for m in re.finditer(r'href="styles\.css\?v=([^"]+)"', p.text)}
     check("all pages pin the same stylesheet version", len(versions) == 1, f"got {sorted(versions)}")
 
 
-def test_client_logo_heights() -> None:
-    """Every <img class="client-logo"> has a per-brand height rule, and the class
-    itself carries a default height as a backstop."""
-    print("\n[15] Client logo sizing")
-    html = strip_comments(INDEX.read_text(encoding="utf-8"))
+def test_links(pages: dict[str, Page]) -> None:
+    print("\n[5] Links")
+    for name, p in pages.items():
+        bad: list[str] = []
+        for a in p.links:
+            if "href" not in a:
+                continue  # illustrative app screens use <a> without href as tab labels
+            href = a["href"]
+            if not href or href == "#" or href.lower().startswith("javascript:"):
+                bad.append(f"empty or script link {href!r}")
+                continue
+            parsed = urlparse(href)
+            if parsed.scheme in ("http", "https"):
+                if a.get("target") == "_blank" and "noopener" not in a.get("rel", ""):
+                    bad.append(f"{href} opens a new tab without rel=noopener")
+                continue
+            if parsed.scheme == "mailto":
+                if parsed.path != EMAIL:
+                    bad.append(f"mail link to {parsed.path}, expected {EMAIL}")
+                continue
+            target_name = parsed.path or name
+            target = pages.get(target_name)
+            if target is None:
+                bad.append(f"{href} points to a missing page")
+                continue
+            if parsed.fragment and parsed.fragment not in target.ids:
+                bad.append(f"{href} points to a missing anchor")
+        check(f"{name}: every link resolves", not bad, "; ".join(bad[:5]))
+        held = [a["href"] for a in p.links if "href" in a and any(h in a["href"] for h in HELD)]
+        check(f"{name}: no links to held pages (careers, insights)", not held, str(held))
+
+
+def test_images(pages: dict[str, Page]) -> None:
+    print("\n[6] Images")
+    for name, p in pages.items():
+        missing = [i.get("src", "") for i in p.imgs if not (ROOT / i.get("src", "")).is_file()]
+        check(f"{name}: every image file exists", not missing, str(missing))
+        check(f"{name}: every image has alt text", all(i.get("alt", "").strip() for i in p.imgs))
+        check(f"{name}: no embedded data images", "base64," not in p.text)
+
+
+def test_shared_chrome(pages: dict[str, Page]) -> None:
+    print("\n[7] Nav and footer copied identically into every page")
+    def plain_nav(p: Page) -> str:
+        return p.block("nav").replace(' class="on"', "")
+    ref = pages["index.html"]
+    for name, p in pages.items():
+        check(f"{name}: nav matches index.html", plain_nav(p) == plain_nav(ref))
+        check(f"{name}: footer matches index.html", p.block("footer") == ref.block("footer"))
+        marked = re.findall(r'data-sec="([^"]+)" class="on"', p.block("nav"))
+        want = NAV_SECTION[name]
+        check(f"{name}: nav highlights {want or 'nothing'}", marked == ([want] if want else []), str(marked))
+
+
+def test_content(pages: dict[str, Page]) -> None:
+    print("\n[8] Content")
+    for name, p in pages.items():
+        check(f"{name}: no placeholder highlights", 'class="ph"' not in p.text)
+        low = p.visible_text.lower()
+        for phrase in ["to confirm", "mockup", "lorem", "todo", "rachit"]:
+            check(f"{name}: no '{phrase}' in visible text", phrase not in low)
+    about = pages["about.html"].visible_text
+    check("about: Sam Garg on the team", "Sam Garg" in about)
+    check("about: Beatriz Abramof on the team", "Beatriz Abramof" in about)
+    check("about: Sam's McKinsey title", "Associate Partner" in about)
+    check("about: timeline starts 2016 to 2024", "2016 to 2024" in about)
+    check("about: no advisors or investors cards", "Advisors" not in about and "Investors" not in about)
+    check("contact: single address shown", EMAIL in pages["contact.html"].visible_text)
+    demo = pages["demo.html"]
+    check("demo: form opens an email to sam@", f"mailto:{EMAIL}" in demo.script())
+    for field in ["first_name", "last_name", "email", "company", "role", "revenue", "interest", "message"]:
+        check(f"demo: form field '{field}' is named", f'name="{field}"' in demo.text)
+    story = pages["story-components-pricing.html"].visible_text
+    check("pricing story: client quote present", "strategic platform" in story and "VP, Pricing" in story)
+    others = [n for n in STORY_PAGES if n != "story-components-pricing.html"]
+    check("other stories: no empty client quote block", all("Client view" not in pages[n].visible_text for n in others))
+
+
+def test_structure(pages: dict[str, Page]) -> None:
+    print("\n[9] Structure")
+    for name, p in pages.items():
+        check(f"{name}: block tags balanced", not p.errors and not p.stack, f"{p.errors[:3]} open: {p.stack[:3]}")
+        check(f"{name}: one nav, one main, one footer",
+              p.text.count("<nav") == 1 and p.text.count("<main>") == 1 and p.text.count("<footer") == 1)
+        check(f"{name}: one script at the bottom", p.text.count("<script") == 1 and
+              p.text.rstrip().endswith("</script>\n</body>\n</html>".strip()))
+
+
+def test_page_scripts(pages: dict[str, Page]) -> None:
+    print("\n[10] Each page carries only the script it needs")
+    for name, p in pages.items():
+        s = p.script()
+        check(f"{name}: mobile menu wired", ".burger" in s and 'class="burger"' in p.text)
+        for marker, fn in [('class="carousel"', "initCarousel"), ('class="console"', "playRun"), ('class="fc', "querySelectorAll('.fc')")]:
+            has_markup, has_code = marker in p.text, fn in s
+            check(f"{name}: {fn} present only where needed", has_markup == has_code,
+                  f"markup={has_markup} code={has_code}")
+
+
+def test_redirects() -> None:
+    print("\n[11] Old addresses redirect")
+    for old, new in REDIRECTS.items():
+        path = ROOT / old
+        if not path.is_file():
+            check(f"{old} redirect exists", False)
+            continue
+        t = path.read_text(encoding="utf-8")
+        check(f"{old} refreshes to {new}", f'content="0; url={new}"' in t)
+        check(f"{old} links to {new}", f'href="{new}"' in t)
+        check(f"{old} is not indexed", 'name="robots" content="noindex"' in t)
+
+
+def test_assets(pages: dict[str, Page]) -> None:
+    print("\n[12] Assets")
+    for rel in REMOVED_ASSETS:
+        check(f"{rel} removed", not (ROOT / rel).exists())
+    used = " ".join(p.text for p in pages.values()) + STYLES.read_text(encoding="utf-8")
+    orphans = sorted(str(f.relative_to(ROOT)) for f in (ROOT / "images").rglob("*")
+                     if f.is_file() and f.name != ".DS_Store" and str(f.relative_to(ROOT)) not in used)
+    check("every file in images/ is used", not orphans, str(orphans))
+
+
+def test_mobile() -> None:
+    print("\n[13] Mobile")
     css = STYLES.read_text(encoding="utf-8")
-    alts = re.findall(r'<img[^>]*alt="([^"]+)"[^>]*class="client-logo"', html)
-    check("client logo strip present", len(alts) >= 1)
-    base = re.search(r"\.client-logo\s*\{[^}]*\bheight:", css)
-    check(".client-logo has a default height", bool(base))
-    for alt in alts:
-        check(
-            f'height rule for logo "{alt}"',
-            bool(re.search(r'\.client-logo\[alt="' + re.escape(alt) + r'"\]\s*\{[^}]*height:', css)),
-        )
+    widths = sorted({int(w) for w in re.findall(r"@media \(max-width:\s*(\d+)px\)", css)})
+    check("styles.css has phone and tablet breakpoints", any(w <= 640 for w in widths) and any(w >= 900 for w in widths), str(widths))
+    check("burger menu shown on small screens", ".burger{display:block}" in css)
+    check("no mockup helper rules left", ".mk" not in css and ".ph{" not in css)
 
 
 def test_online() -> None:
-    print("\n[13] Online checks")
-    branch_url = (
-        "https://raw.githubusercontent.com/ragarwal23/ragarwal.io/"
-        "redesign-eilla/index.html"
-    )
-    try:
-        with urllib.request.urlopen(branch_url, timeout=15) as r:
-            r.read(1024)
-        check("redesign-eilla branch index.html fetched", True)
-    except Exception as e:
-        check("redesign-eilla branch index.html fetched", False, str(e))
-
+    print("\n[14] Online checks")
     if cname_configured():
-        # Compare against *this* repo's main: the site has lived in more than
-        # one GitHub repo (ragarwal23/ragarwal.io, then pvr-technologies/...),
-        # so the owner/name is taken from Actions' GITHUB_REPOSITORY or the
-        # origin remote rather than hardcoded.
-        main_cname_url = (
-            f"https://raw.githubusercontent.com/{github_repo()}/main/CNAME"
-        )
+        main_cname_url = f"https://raw.githubusercontent.com/{github_repo()}/main/CNAME"
         try:
             with urllib.request.urlopen(main_cname_url, timeout=15) as r:
                 cname_main = r.read().decode().strip()
-            check(
-                "main CNAME is a known domain",
-                cname_main in {"aristotletechnology.com", "thearistotle.ai"},
-                f"got {cname_main!r}",
-            )
+            check("main CNAME is a known domain", cname_main in {"aristotletechnology.com", "thearistotle.ai"},
+                  f"got {cname_main!r}")
         except Exception as e:
             check("main CNAME fetch", False, str(e))
     else:
         skip("no CNAME in this checkout — remote main CNAME check skipped")
 
-    live = "https://thearistotle.ai/"
+    live = SITE
     try:
         with urllib.request.urlopen(live, timeout=10) as r:
             status = r.status
             body = r.read(4096).decode("utf-8", errors="replace")
         check(f"live site {live} returned 200", status == 200, f"status={status}")
-        check(
-            "live site is the Aristotle page",
-            "Aristotle" in body or "ARISTOTLE" in body,
-            "headline marker missing",
-        )
+        check("live site is the Aristotle page", "Aristotle" in body, "headline marker missing")
     except Exception as e:
         print(f"  \033[33m!\033[0m live site {live} not yet reachable: {e}")
 
@@ -680,33 +410,24 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"Aristotle site checks — repo: {ROOT}")
-
-    index_p = parse(INDEX)
-    team_p = parse(TEAM)
-    insights_p = parse(INSIGHTS)
-
-    test_files_exist()
-    test_cname()
-    test_html_head(index_p, "index.html", INDEX)
-    test_html_head(team_p, "team.html", TEAM)
-    test_html_head(insights_p, "insights.html", INSIGHTS)
-    test_anchors(index_p, "index.html")
-    test_images(index_p, "index.html")
-    test_images(team_p, "team.html")
-    test_images(insights_p, "insights.html")
-    test_required_sections(index_p)
-    test_design_tokens()
-    test_content_invariants()
-    test_team_page(team_p)
-    test_insights_page(insights_p)
-    test_structural_counts()
-    test_no_visible_placeholders()
-    test_balanced_tags(index_p, "index.html")
-    test_balanced_tags(team_p, "team.html")
-    test_balanced_tags(insights_p, "insights.html")
-    test_mobile_friendly()
-    test_stylesheet_cache_bust()
-    test_client_logo_heights()
+    loaded = {name: load(name) for name in PAGES}
+    test_files_exist(loaded)
+    pages = {n: p for n, p in loaded.items() if p is not None}
+    if len(pages) != len(PAGES):
+        print("\nPages are missing; later checks need every page.")
+    else:
+        test_cname()
+        test_heads(pages)
+        test_stylesheet_version(pages)
+        test_links(pages)
+        test_images(pages)
+        test_shared_chrome(pages)
+        test_content(pages)
+        test_structure(pages)
+        test_page_scripts(pages)
+        test_redirects()
+        test_assets(pages)
+        test_mobile()
     if args.online:
         test_online()
 
